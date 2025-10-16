@@ -54,9 +54,10 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
-from collections.abc import Mapping 
+from collections.abc import Mapping
+from datetime import datetime as _dt
 
-APP_TITLE = "Faktury – monitor Google Drive"
+APP_TITLE = "Faktury – monitor faktur QUEST"
 EXCEL_BASENAME = "faktury.xlsx"  # kept in the same Drive folder
 STATE_FILENAME = "state.json"     # tracks seen file IDs (also in Drive folder)
 
@@ -475,8 +476,47 @@ def _sorted_index(df: pd.DataFrame, col: str, asc: bool) -> pd.Index:
     # mergesort = stabilne sortowanie (nie miesza rzędów przy equal)
     return key.sort_values(ascending=asc, kind="mergesort").index
 
-# ---------- APP ----------
 
+
+
+
+def _excel_bytes_two_sheets(df_all: pd.DataFrame, df_due: pd.DataFrame, mask_amounts: bool) -> bytes:
+    """Zwraca bytes pliku .xlsx z dwiema zakładkami: Wszystkie, Do_zaplaty.
+       Jeśli mask_amounts=True (np. rola admin), kwoty są zamieniane na '—' także w pliku."""
+    a = df_all.copy()
+    d = df_due.copy()
+
+    if mask_amounts:
+        for col in ["kwota", "netto", "brutto"]:
+            if col in a.columns:
+                a[col] = "—"
+            if col in d.columns:
+                d[col] = "—"
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        a.to_excel(w, index=False, sheet_name="Wszystkie")
+        d.to_excel(w, index=False, sheet_name="Do_zaplaty")
+    buf.seek(0)
+    return buf.getvalue()
+
+def _excel_bytes_single(df: pd.DataFrame, sheet_name: str, mask_amounts: bool) -> bytes:
+    """Pojedyncza tabela jako .xlsx (jedna zakładka)."""
+    x = df.copy()
+    if mask_amounts:
+        for col in ["kwota", "netto", "brutto"]:
+            if col in x.columns:
+                x[col] = "—"
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        x.to_excel(w, index=False, sheet_name=sheet_name)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+
+
+# ---------- APP ----------
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
@@ -492,12 +532,12 @@ def main():
     seen_ids = set(state.get("seen", []))
     df = load_excel_df(service, folder_id)
 
-
     # Uporządkuj kolejność kolumn (jeśli jakieś brakuje – zostaną na końcu)
-    preferred = ["file_id", "nazwa_dokumentu", "Data wprowadzenia rachunku", "opis",
-                "kwota", "netto", "brutto", "termin_platnosci", "zaplacone"]
+    preferred = [
+        "file_id", "nazwa_dokumentu", "Data wprowadzenia rachunku", "opis",
+        "kwota", "netto", "brutto", "termin_platnosci", "zaplacone"
+    ]
     df = df[[c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]]
-
 
     # Scan PDFs
     with st.spinner("Sprawdzam nowe pliki PDF w folderze..."):
@@ -512,7 +552,7 @@ def main():
             parsed = parse_invoice(content, f.get("name", ""))
             row = {
                 "file_id": fid,
-                "nazwa_dokumentu": f.get("name", ""),  # ← tylko nazwa pliku z Drive
+                "nazwa_dokumentu": f.get("name", ""),  # nazwa pliku z Drive
                 "Data wprowadzenia rachunku": f.get("modifiedTime", f.get("createdTime", ""))[:10],
                 "opis": parsed.get("opis"),
                 "kwota": parsed.get("kwota"),
@@ -521,7 +561,6 @@ def main():
                 "termin_platnosci": parsed.get("termin_platnosci"),
                 "zaplacone": False,
             }
-            
             new_rows.append(row)
             seen_ids.add(fid)
 
@@ -532,7 +571,7 @@ def main():
             save_state(service, folder_id, {"seen": list(seen_ids)})
 
     # --- Manual sync button ---
-    colA, colB = st.columns([1,3])
+    colA, colB = st.columns([1, 3])
     with colA:
         if st.button("🔄 Odśwież / zsynchronizuj z Google Drive", width="stretch"):
             df, seen_ids, removed = sync_with_drive(service, folder_id, df, seen_ids)
@@ -544,15 +583,14 @@ def main():
     # Role-based column visibility / editability
     view_df = df.copy()
     if role == "admin":
-        # Admin cannot see amounts
+        # Admin nie widzi kwot
         for col in ["kwota", "netto", "brutto"]:
             if col in view_df.columns:
                 view_df[col] = "—"
 
     st.subheader("Wszystkie dokumenty")
 
-
-    # --- kontrolki sortowania ---
+    # --- kontrolki sortowania (Wszystkie) ---
     sortable_all = [c for c in [
         "nazwa_dokumentu", "Data wprowadzenia rachunku", "opis",
         "kwota", "netto", "brutto", "termin_platnosci", "zaplacone"
@@ -560,11 +598,20 @@ def main():
 
     csa, csb = st.columns([2, 1])
     with csa:
-        sort_col_all = st.selectbox("Sortuj wg (wszystkie):", options=sortable_all,
-                                    index=0, key="sort_all_col")
+        sort_col_all = st.selectbox(
+            "Sortuj wg (wszystkie):",
+            options=sortable_all,
+            index=0,
+            key="sort_all_col"
+        )
     with csb:
-        sort_dir_all = st.radio("Kierunek", ["⬇︎ malejąco", "⬆︎ rosnąco"],
-                                horizontal=True, index=0, key="sort_all_dir")
+        sort_dir_all = st.radio(
+            "Kierunek",
+            ["⬇︎ malejąco", "⬆︎ rosnąco"],
+            horizontal=True,
+            index=0,
+            key="sort_all_dir"
+        )
 
     asc_all = (sort_dir_all.endswith("rosnąco"))
     idx_all = _sorted_index(df, sort_col_all, asc_all)
@@ -572,7 +619,20 @@ def main():
     df = df.loc[idx_all].reset_index(drop=True)
     view_df = view_df.loc[idx_all].reset_index(drop=True)
 
-    # --- edytor (jak wcześniej) ---
+    # --- przyciski pobierania (Wszystkie) ---
+    mask_amounts = (role == "admin")
+    fname_all = f"rachunki_wszystkie_{dt.datetime.now().strftime('%Y-%m-%d')}.xlsx"
+    dl1, _ = st.columns([1, 3])
+    with dl1:
+        st.download_button(
+            label="⬇️ Pobierz tę tabelę (Excel)",
+            data=_excel_bytes_single(view_df, "Wszystkie", mask_amounts),
+            file_name=fname_all,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_all_single",
+        )
+
+    # --- edytor (Wszystkie) ---
     can_edit_paid = (role == "ksiegowosc")
     disabled_param = [c for c in view_df.columns if c != "zaplacone"] if can_edit_paid else True
 
@@ -590,7 +650,6 @@ def main():
         key="all_table",
     )
 
-
     # zapis zmian tylko dla księgowości
     if can_edit_paid and not df.empty and {"file_id","zaplacone"} <= set(df.columns) and {"file_id","zaplacone"} <= set(edited.columns):
         merged = df.merge(edited[["file_id","zaplacone"]], on="file_id", suffixes=("", "_new"), how="left")
@@ -602,10 +661,8 @@ def main():
             save_excel_df(service, folder_id, df)
             st.success("Zapisano zmiany w Excelu")
 
-
     # --- Tab: Do zapłaty na dzisiaj ---
     st.subheader("Do zapłaty na dzisiaj")
-    today = dt.date.today().isoformat()
     due_dates = pd.to_datetime(df["termin_platnosci"], errors="coerce").dt.date
     due_mask = (~df["zaplacone"].astype(bool)) & due_dates.notna() & (due_dates <= dt.date.today())
     due_df = df.loc[due_mask].copy()
@@ -615,7 +672,7 @@ def main():
             if col in due_df.columns:
                 due_df[col] = "—"
 
-    # --- kontrolki sortowania dla 'Do zapłaty' ---
+    # --- kontrolki sortowania (Do zapłaty) ---
     sortable_due = [c for c in [
         "termin_platnosci", "nazwa_dokumentu", "Data wprowadzenia rachunku",
         "opis", "kwota", "netto", "brutto"
@@ -623,22 +680,56 @@ def main():
 
     csd1, csd2 = st.columns([2, 1])
     with csd1:
-        sort_col_due = st.selectbox("Sortuj wg (do zapłaty):", options=sortable_due,
-                                    index=0 if "termin_platnosci" in sortable_due else 0,
-                                    key="sort_due_col")
+        sort_col_due = st.selectbox(
+            "Sortuj wg (do zapłaty):",
+            options=sortable_due,
+            index=0 if "termin_platnosci" in sortable_due else 0,
+            key="sort_due_col"
+        )
     with csd2:
-        sort_dir_due = st.radio("Kierunek", ["⬇︎ malejąco", "⬆︎ rosnąco"],
-                                horizontal=True, index=0, key="sort_due_dir")
+        sort_dir_due = st.radio(
+            "Kierunek",
+            ["⬇︎ malejąco", "⬆︎ rosnąco"],
+            horizontal=True,
+            index=0,
+            key="sort_due_dir"
+        )
 
     asc_due = (sort_dir_due.endswith("rosnąco"))
-    # UWAGA: do wyliczenia kolejności użyjemy due_df „niemaskowanego” —
-    # ale jeśli jesteś adminem, maskowanie dotyczy tylko wartości wyświetlanych.
+    # sortujemy po bazowym df (niemaskowanym), ale wyświetlamy due_df (dla admina maskowane)
     base_for_sort = df.loc[due_mask].copy()
     idx_due = _sorted_index(base_for_sort, sort_col_due, asc_due)
     due_df = due_df.iloc[base_for_sort.index.get_indexer(idx_due)].reset_index(drop=True)
 
+    # --- przyciski pobierania (Do zapłaty + łączny plik) ---
+    fname_due = f"rachunki_do_zaplaty_{dt.datetime.now().strftime('%Y-%m-%d')}.xlsx"
+    col_d1, col_d2 = st.columns([1, 1])
+    with col_d1:
+        st.download_button(
+            label="⬇️ Pobierz tę tabelę (Excel)",
+            data=_excel_bytes_single(due_df, "Do_zaplaty", mask_amounts=(role == "admin")),
+            file_name=fname_due,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_due_single",
+        )
+    with col_d2:
+        both_bytes = _excel_bytes_two_sheets(
+            df_all=view_df,   # szanujemy aktualny widok użytkownika
+            df_due=due_df,
+            mask_amounts=(role == "admin")
+        )
+        st.download_button(
+            label="⬇️ Pobierz obie tabele (Excel: 2 zakładki)",
+            data=both_bytes,
+            file_name=f"rachunki_{dt.datetime.now().strftime('%Y-%m-%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_both_two_sheets",
+        )
+
+    # --- render tabeli 'Do zapłaty' ---
     st.dataframe(due_df, width="stretch", hide_index=True)
-    
+
+    # Diagnostyka tylko dla admina
     if role == "admin":
         with st.expander("🛠️ Diagnostyka / pomoc"):
             st.write({
@@ -648,7 +739,6 @@ def main():
                 "rows_total": len(df),
             })
             st.caption("Jeśli OCR nie działa, zainstaluj Poppler i Tesseract na serwerze.")
-
 
 
 if __name__ == "__main__":
