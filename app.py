@@ -56,6 +56,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 from collections.abc import Mapping
 from datetime import datetime as _dt
+import bcrypt
 
 APP_TITLE = "Faktury – monitor faktur QUEST"
 EXCEL_BASENAME = "faktury.xlsx"  # kept in the same Drive folder
@@ -69,26 +70,74 @@ REQUIRED_COLUMNS = [
 
 
 # ---------- UTIL: AUTH ----------
+def get_role_from_login():
+    """
+    Zwraca rolę zalogowanego użytkownika albo None (gdy nie zalogowany).
+    1) Jeśli Streamlit SSO poda email – wstawiamy go do formularza.
+    2) Weryfikujemy hasło przez users.json na Google Drive (verify_user_password).
+    3) Rate-limit: 5 nieudanych prób → blokada na 60s.
+    """
+    # --- SSO z Streamlit Cloud (opcjonalnie) ---
+    sso_user = getattr(st, "experimental_user", None)
+    sso_email = getattr(sso_user, "email", None)
 
-def get_role_from_login() -> Optional[str]:
-    if "role" in st.session_state:
+    # --- Session: blokada po wielu błędach ---
+    fails = st.session_state.get("login_fails", 0)
+    lock_until = st.session_state.get("login_lock_until", 0)
+    now = time.time()
+    if now < lock_until:
+        remaining = int(lock_until - now)
+        st.error(f"Zbyt wiele prób logowania. Spróbuj ponownie za {remaining}s.")
+        return None
+
+    # --- Jeśli już zalogowany w tej sesji, zwróć rolę ---
+    if "role" in st.session_state and "user_email" in st.session_state:
         return st.session_state["role"]
 
-    st.sidebar.header("Logowanie")
-    role = st.sidebar.selectbox("Użytkownik", ["ksiegowosc", "krzysztof", "admin"], index=0)
-    pwd = st.sidebar.text_input("Hasło", type="password")
-    if st.sidebar.button("Zaloguj"):
-        secrets = st.secrets.get("users", {})
-        expected = secrets.get(f"{role}_password")
-        if expected and pwd == expected:
-            st.session_state["role"] = role
-            st.session_state["logged_in_at"] = dt.datetime.now().isoformat()
-            st.sidebar.success(f"Zalogowano jako {role}")
-            return role
+    # --- Formularz logowania (email + hasło) ---
+    st.subheader("Logowanie")
+    email = st.text_input("E-mail", value=sso_email or "", key="login_email").strip()
+    password = st.text_input("Hasło", type="password", key="login_password")
+
+    col_l, col_r = st.columns([1, 1])
+    with col_l:
+        ok = st.button("Zaloguj", type="primary", key="btn_login")
+    with col_r:
+        if st.button("Wyloguj", key="btn_logout"):
+            for k in ("role", "user_email", "login_fails", "login_lock_until"):
+                st.session_state.pop(k, None)
+            st.experimental_rerun()
+
+    if not ok:
+        return None
+
+    # --- Weryfikacja po stronie Drive (users.json) ---
+    try:
+        service, folder_id = drive_service()  # potrzebny do odczytu users.json
+    except Exception as e:
+        st.error(f"Błąd inicjalizacji Drive: {e}")
+        return None
+
+    role = verify_user_password(service, folder_id, email, password)
+    if role:
+        # sukces logowania
+        st.session_state["role"] = role
+        st.session_state["user_email"] = email
+        st.session_state["login_fails"] = 0
+        st.session_state["login_lock_until"] = 0
+        st.success(f"Zalogowano jako {role}")
+        return role
+    else:
+        # porażka logowania → inkrementuj i ewentualnie zablokuj
+        fails += 1
+        st.session_state["login_fails"] = fails
+        if fails >= 5:
+            st.session_state["login_lock_until"] = time.time() + 60  # 60s blokady
+            st.session_state["login_fails"] = 0
+            st.error("Zbyt wiele nieudanych prób. Zablokowano na 60 sekund.")
         else:
-            st.sidebar.error("Błędny użytkownik lub hasło")
-            return None
-    return None
+            st.error("Błędny e-mail lub hasło.")
+        return None
 
 # ---------- UTIL: DRIVE ----------
 def drive_service():
@@ -514,6 +563,100 @@ def _excel_bytes_single(df: pd.DataFrame, sheet_name: str, mask_amounts: bool) -
     return buf.getvalue()
 
 
+# Zmiana haseł i administrowanie użytkownikami
+
+def _load_users_doc(service, folder_id) -> dict:
+    """Wczytuje users.json z Drive. Jeśli brak – zwraca szablon."""
+    f = find_file_by_name(service, folder_id, USERS_FILENAME)
+    if not f:
+        return {"version": 1, "users": []}
+    raw = download_bytes(service, f["id"]) or b"{}"
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+        if "users" not in doc: doc["users"] = []
+        if "version" not in doc: doc["version"] = 1
+        return doc
+    except Exception:
+        return {"version": 1, "users": []}
+
+def _save_users_doc(service, folder_id, doc: dict):
+    payload = json.dumps(doc, ensure_ascii=False, indent=2).encode("utf-8")
+    upload_or_update_file(service, folder_id, USERS_FILENAME, payload, "application/json")
+
+def _append_audit(service, folder_id, entry: dict):
+    """Dopisuje rekord do audit logu (lista JSON)."""
+    f = find_file_by_name(service, folder_id, USERS_AUDIT_FILENAME)
+    items = []
+    if f:
+        raw = download_bytes(service, f["id"]) or b"[]"
+        try:
+            items = json.loads(raw.decode("utf-8"))
+            if not isinstance(items, list): items = []
+        except Exception:
+            items = []
+    items.append(entry)
+    upload_or_update_file(
+        service, folder_id, USERS_AUDIT_FILENAME,
+        json.dumps(items, ensure_ascii=False, indent=2).encode("utf-8"),
+        "application/json"
+    )
+
+def _user_find(doc: dict, email: str) -> dict | None:
+    email = email.lower().strip()
+    for u in doc.get("users", []):
+        if u.get("email", "").lower() == email:
+            return u
+    return None
+
+def _user_set_hash(doc: dict, email: str, role: str, pw_plain: str):
+    """Ustawia/aktualizuje użytkownika i jego hash (tworzy jeśli brak)."""
+    email = email.lower().strip()
+    h = bcrypt.hashpw(pw_plain.encode(), bcrypt.gensalt()).decode()
+    u = _user_find(doc, email)
+    if u:
+        u["hash"] = h
+        u["role"] = role
+    else:
+        doc["users"].append({"email": email, "role": role, "hash": h})
+    doc["version"] = int(doc.get("version", 1)) + 1
+
+def verify_user_password(service, folder_id, email: str, pw_plain: str) -> str | None:
+    """Zwraca rolę po poprawnym haśle, inaczej None."""
+    doc = _load_users_doc(service, folder_id)
+    u = _user_find(doc, email)
+    if not u: return None
+    try:
+        if bcrypt.checkpw(pw_plain.encode(), u["hash"].encode()):
+            return u.get("role")
+    except Exception:
+        return None
+    return None
+
+def change_own_password(service, folder_id, email: str, old_pw: str, new_pw: str) -> bool:
+    doc = _load_users_doc(service, folder_id)
+    u = _user_find(doc, email)
+    if not u:
+        st.error("Użytkownik nie istnieje.")
+        return False
+    if not bcrypt.checkpw(old_pw.encode(), u["hash"].encode()):
+        st.error("Stare hasło niepoprawne.")
+        return False
+    _user_set_hash(doc, email, u.get("role",""), new_pw)
+    _save_users_doc(service, folder_id, doc)
+    _append_audit(service, folder_id, {
+        "ts": int(time.time()), "who": email, "action": "change_password_self"
+    })
+    return True
+
+def admin_set_password(service, folder_id, admin_email: str, target_email: str, role: str, new_pw: str) -> bool:
+    doc = _load_users_doc(service, folder_id)
+    _user_set_hash(doc, target_email, role, new_pw)
+    _save_users_doc(service, folder_id, doc)
+    _append_audit(service, folder_id, {
+        "ts": int(time.time()), "who": admin_email, "action": "admin_set_password",
+        "target": target_email, "role": role
+    })
+    return True
 
 
 # ---------- APP ----------
@@ -739,6 +882,40 @@ def main():
                 "rows_total": len(df),
             })
             st.caption("Jeśli OCR nie działa, zainstaluj Poppler i Tesseract na serwerze.")
+st.divider()
+st.subheader("🔐 Zmiana hasła")
+
+email_logged = st.session_state.get("user_email") or ""
+col1, col2 = st.columns(2)
+
+with col1:
+    st.caption("Zmiana własnego hasła")
+    old_pw = st.text_input("Stare hasło", type="password", key="own_old")
+    new_pw1 = st.text_input("Nowe hasło", type="password", key="own_new1")
+    new_pw2 = st.text_input("Powtórz nowe hasło", type="password", key="own_new2")
+    if st.button("Zmień własne hasło", type="primary", key="btn_change_own"):
+        if new_pw1 != new_pw2:
+            st.error("Nowe hasła nie są identyczne.")
+        elif len(new_pw1) < 8:
+            st.error("Hasło musi mieć co najmniej 8 znaków.")
+        else:
+            ok = change_own_password(service, folder_id, email_logged, old_pw, new_pw1)
+            if ok:
+                st.success("Hasło zmienione.")
+                st.experimental_rerun()
+
+with col2:
+    if role == "admin":
+        st.caption("Reset / ustawienie hasła przez administratora")
+        target_email = st.text_input("E-mail użytkownika", value=email_logged, key="adm_target")
+        role_sel = st.selectbox("Rola", ["ksiegowosc", "krzysztof", "admin"], key="adm_role")
+        new_pw_admin = st.text_input("Nowe hasło użytkownika", type="password", key="adm_new")
+        if st.button("Ustaw hasło użytkownika", key="btn_admin_set"):
+            if len(new_pw_admin) < 8:
+                st.error("Hasło musi mieć co najmniej 8 znaków.")
+            else:
+                admin_set_password(service, folder_id, email_logged, target_email, role_sel, new_pw_admin)
+                st.success(f"Ustawiono hasło dla: {target_email}")
 
 
 if __name__ == "__main__":
