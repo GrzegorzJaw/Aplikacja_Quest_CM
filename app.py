@@ -69,6 +69,10 @@ REQUIRED_COLUMNS = [
 ]
 
 
+# --- KONFIG UŻYTKOWNIKÓW (pliki na Google Drive) ---
+USERS_FILENAME = "users.json"
+USERS_AUDIT_FILENAME = "users_audit.json"
+
 # ---------- UTIL: AUTH ----------
 def get_role_from_login():
     """
