@@ -1,0 +1,7 @@
+.streamlit/
+secrets.toml
+*.pyc
+__pycache__/
+.env
+.conda/
+rachunki_2025/
