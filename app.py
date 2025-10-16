@@ -573,20 +573,28 @@ def _excel_bytes_single(df: pd.DataFrame, sheet_name: str, mask_amounts: bool) -
 
 
 # Zmiana haseł i administrowanie użytkownikami
-
 def _load_users_doc(service, folder_id) -> dict:
-    """Wczytuje users.json z Drive. Jeśli brak – zwraca szablon."""
     f = find_file_by_name(service, folder_id, USERS_FILENAME)
     if not f:
         return {"version": 1, "users": []}
     raw = download_bytes(service, f["id"]) or b"{}"
     try:
+        import json
         doc = json.loads(raw.decode("utf-8"))
-        if "users" not in doc: doc["users"] = []
-        if "version" not in doc: doc["version"] = 1
+
+        # if old format: list on top level -> wrap to {"users": [...]}
+        if isinstance(doc, list):
+            doc = {"version": 1, "users": doc}
+
+        # ensure keys
+        if "users" not in doc or not isinstance(doc["users"], list):
+            doc["users"] = []
+        if "version" not in doc:
+            doc["version"] = 1
         return doc
     except Exception:
         return {"version": 1, "users": []}
+
 
 def _save_users_doc(service, folder_id, doc: dict):
     payload = json.dumps(doc, ensure_ascii=False, indent=2).encode("utf-8")
@@ -630,16 +638,34 @@ def _user_set_hash(doc: dict, email: str, role: str, pw_plain: str):
     doc["version"] = int(doc.get("version", 1)) + 1
 
 def verify_user_password(service, folder_id, email: str, pw_plain: str) -> str | None:
-    """Zwraca rolę po poprawnym haśle, inaczej None."""
     doc = _load_users_doc(service, folder_id)
     u = _user_find(doc, email)
-    if not u: return None
-    try:
-        if bcrypt.checkpw(pw_plain.encode(), u["hash"].encode()):
-            return u.get("role")
-    except Exception:
+    if not u:
         return None
+
+    # 1) Prefer hash bcrypt
+    if "hash" in u and isinstance(u["hash"], str) and u["hash"]:
+        try:
+            if bcrypt.checkpw(pw_plain.encode(), u["hash"].encode()):
+                return u.get("role")
+        except Exception:
+            return None
+
+    # 2) Fallback: stary format z plaintext "password" -> sprawdź i MIGRUJ do hash
+    if "password" in u and isinstance(u["password"], str):
+        if pw_plain == u["password"]:
+            # migrate to hash
+            _user_set_hash(doc, email, u.get("role", ""), pw_plain)
+            # usuń plaintext
+            for uu in doc["users"]:
+                if uu.get("email", "").lower() == email.lower():
+                    uu.pop("password", None)
+                    break
+            _save_users_doc(service, folder_id, doc)
+            return u.get("role")
+
     return None
+
 
 def change_own_password(service, folder_id, email: str, old_pw: str, new_pw: str) -> bool:
     doc = _load_users_doc(service, folder_id)
