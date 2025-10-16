@@ -658,19 +658,18 @@ def admin_set_password(service, folder_id, admin_email: str, target_email: str, 
     })
     return True
 
-
 # ---------- APP ----------
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
 
+    # --- Logowanie / rola ---
     role = get_role_from_login()
     if not role:
         st.stop()
 
+    # --- Drive + stan + Excel ---
     service, folder_id = drive_service()
-
-    # Load state and Excel
     state = load_state(service, folder_id)
     seen_ids = set(state.get("seen", []))
     df = load_excel_df(service, folder_id)
@@ -682,7 +681,7 @@ def main():
     ]
     df = df[[c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]]
 
-    # Scan PDFs
+    # --- Skanowanie nowych PDF-ów ---
     with st.spinner("Sprawdzam nowe pliki PDF w folderze..."):
         pdfs = list_pdfs(service, folder_id)
         new_rows = []
@@ -690,9 +689,10 @@ def main():
             fid = f["id"]
             if fid in seen_ids:
                 continue
-            # parse
+
             content = download_bytes(service, fid)
             parsed = parse_invoice(content, f.get("name", ""))
+
             row = {
                 "file_id": fid,
                 "nazwa_dokumentu": f.get("name", ""),  # nazwa pliku z Drive
@@ -709,12 +709,11 @@ def main():
 
         if new_rows:
             df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
-            # persist both state and excel
             save_excel_df(service, folder_id, df)
             save_state(service, folder_id, {"seen": list(seen_ids)})
 
-    # --- Manual sync button ---
-    colA, colB = st.columns([1, 3])
+    # --- Ręczna synchronizacja (wykrywa usunięte z folderu) ---
+    colA, _ = st.columns([1, 3])
     with colA:
         if st.button("🔄 Odśwież / zsynchronizuj z Google Drive", width="stretch"):
             df, seen_ids, removed = sync_with_drive(service, folder_id, df, seen_ids)
@@ -723,17 +722,19 @@ def main():
             else:
                 st.info("Brak zmian. Folder i tabela są zsynchronizowane.")
 
-    # Role-based column visibility / editability
+    # --- Widok zależny od roli (admin nie widzi kwot) ---
     view_df = df.copy()
     if role == "admin":
-        # Admin nie widzi kwot
         for col in ["kwota", "netto", "brutto"]:
             if col in view_df.columns:
                 view_df[col] = "—"
 
+    # =========================
+    # Sekcja: WSZYSTKIE DOKUMENTY
+    # =========================
     st.subheader("Wszystkie dokumenty")
 
-    # --- kontrolki sortowania (Wszystkie) ---
+    # Sortowanie
     sortable_all = [c for c in [
         "nazwa_dokumentu", "Data wprowadzenia rachunku", "opis",
         "kwota", "netto", "brutto", "termin_platnosci", "zaplacone"
@@ -742,27 +743,19 @@ def main():
     csa, csb = st.columns([2, 1])
     with csa:
         sort_col_all = st.selectbox(
-            "Sortuj wg (wszystkie):",
-            options=sortable_all,
-            index=0,
-            key="sort_all_col"
+            "Sortuj wg (wszystkie):", options=sortable_all, index=0, key="sort_all_col"
         )
     with csb:
         sort_dir_all = st.radio(
-            "Kierunek",
-            ["⬇︎ malejąco", "⬆︎ rosnąco"],
-            horizontal=True,
-            index=0,
-            key="sort_all_dir"
+            "Kierunek", ["⬇︎ malejąco", "⬆︎ rosnąco"], horizontal=True, index=0, key="sort_all_dir"
         )
 
-    asc_all = (sort_dir_all.endswith("rosnąco"))
+    asc_all = sort_dir_all.endswith("rosnąco")
     idx_all = _sorted_index(df, sort_col_all, asc_all)
-    # sortujemy oba DF, żeby edycja i zapis szły w tej samej kolejności
     df = df.loc[idx_all].reset_index(drop=True)
     view_df = view_df.loc[idx_all].reset_index(drop=True)
 
-    # --- przyciski pobierania (Wszystkie) ---
+    # Pobranie Excela (pojedyncza tabela)
     mask_amounts = (role == "admin")
     fname_all = f"rachunki_wszystkie_{dt.datetime.now().strftime('%Y-%m-%d')}.xlsx"
     dl1, _ = st.columns([1, 3])
@@ -775,7 +768,7 @@ def main():
             key="dl_all_single",
         )
 
-    # --- edytor (Wszystkie) ---
+    # Edycja „Zaplacone?” tylko dla księgowości
     can_edit_paid = (role == "ksiegowosc")
     disabled_param = [c for c in view_df.columns if c != "zaplacone"] if can_edit_paid else True
 
@@ -793,7 +786,6 @@ def main():
         key="all_table",
     )
 
-    # zapis zmian tylko dla księgowości
     if can_edit_paid and not df.empty and {"file_id","zaplacone"} <= set(df.columns) and {"file_id","zaplacone"} <= set(edited.columns):
         merged = df.merge(edited[["file_id","zaplacone"]], on="file_id", suffixes=("", "_new"), how="left")
         mask = merged["zaplacone"] != merged["zaplacone_new"]
@@ -804,7 +796,9 @@ def main():
             save_excel_df(service, folder_id, df)
             st.success("Zapisano zmiany w Excelu")
 
-    # --- Tab: Do zapłaty na dzisiaj ---
+    # =========================
+    # Sekcja: DO ZAPŁATY NA DZIŚ
+    # =========================
     st.subheader("Do zapłaty na dzisiaj")
     due_dates = pd.to_datetime(df["termin_platnosci"], errors="coerce").dt.date
     due_mask = (~df["zaplacone"].astype(bool)) & due_dates.notna() & (due_dates <= dt.date.today())
@@ -815,7 +809,7 @@ def main():
             if col in due_df.columns:
                 due_df[col] = "—"
 
-    # --- kontrolki sortowania (Do zapłaty) ---
+    # Sortowanie „Do zapłaty”
     sortable_due = [c for c in [
         "termin_platnosci", "nazwa_dokumentu", "Data wprowadzenia rachunku",
         "opis", "kwota", "netto", "brutto"
@@ -831,20 +825,15 @@ def main():
         )
     with csd2:
         sort_dir_due = st.radio(
-            "Kierunek",
-            ["⬇︎ malejąco", "⬆︎ rosnąco"],
-            horizontal=True,
-            index=0,
-            key="sort_due_dir"
+            "Kierunek", ["⬇︎ malejąco", "⬆︎ rosnąco"], horizontal=True, index=0, key="sort_due_dir"
         )
 
-    asc_due = (sort_dir_due.endswith("rosnąco"))
-    # sortujemy po bazowym df (niemaskowanym), ale wyświetlamy due_df (dla admina maskowane)
-    base_for_sort = df.loc[due_mask].copy()
+    asc_due = sort_dir_due.endswith("rosnąco")
+    base_for_sort = df.loc[due_mask].copy()  # niemaskowane do wyliczenia kolejności
     idx_due = _sorted_index(base_for_sort, sort_col_due, asc_due)
     due_df = due_df.iloc[base_for_sort.index.get_indexer(idx_due)].reset_index(drop=True)
 
-    # --- przyciski pobierania (Do zapłaty + łączny plik) ---
+    # Pobranie Excela (do zapłaty + łączny plik 2-zakładkowy)
     fname_due = f"rachunki_do_zaplaty_{dt.datetime.now().strftime('%Y-%m-%d')}.xlsx"
     col_d1, col_d2 = st.columns([1, 1])
     with col_d1:
@@ -857,9 +846,9 @@ def main():
         )
     with col_d2:
         both_bytes = _excel_bytes_two_sheets(
-            df_all=view_df,   # szanujemy aktualny widok użytkownika
+            df_all=view_df,   # szanujemy aktualny widok (admin ma maskę)
             df_due=due_df,
-            mask_amounts=(role == "admin")
+            mask_amounts=(role == "admin"),
         )
         st.download_button(
             label="⬇️ Pobierz obie tabele (Excel: 2 zakładki)",
@@ -869,10 +858,9 @@ def main():
             key="dl_both_two_sheets",
         )
 
-    # --- render tabeli 'Do zapłaty' ---
     st.dataframe(due_df, width="stretch", hide_index=True)
 
-    # Diagnostyka tylko dla admina
+    # --- Diagnostyka tylko dla admina ---
     if role == "admin":
         with st.expander("🛠️ Diagnostyka / pomoc"):
             st.write({
@@ -882,40 +870,44 @@ def main():
                 "rows_total": len(df),
             })
             st.caption("Jeśli OCR nie działa, zainstaluj Poppler i Tesseract na serwerze.")
-st.divider()
-st.subheader("🔐 Zmiana hasła")
 
-email_logged = st.session_state.get("user_email") or ""
-col1, col2 = st.columns(2)
+    # =========================
+    # Sekcja: ZMIANA HASŁA
+    # =========================
+    st.divider()
+    st.subheader("🔐 Zmiana hasła")
 
-with col1:
-    st.caption("Zmiana własnego hasła")
-    old_pw = st.text_input("Stare hasło", type="password", key="own_old")
-    new_pw1 = st.text_input("Nowe hasło", type="password", key="own_new1")
-    new_pw2 = st.text_input("Powtórz nowe hasło", type="password", key="own_new2")
-    if st.button("Zmień własne hasło", type="primary", key="btn_change_own"):
-        if new_pw1 != new_pw2:
-            st.error("Nowe hasła nie są identyczne.")
-        elif len(new_pw1) < 8:
-            st.error("Hasło musi mieć co najmniej 8 znaków.")
-        else:
-            ok = change_own_password(service, folder_id, email_logged, old_pw, new_pw1)
-            if ok:
-                st.success("Hasło zmienione.")
-                st.experimental_rerun()
+    email_logged = st.session_state.get("user_email") or ""
+    col1, col2 = st.columns(2)
 
-with col2:
-    if role == "admin":
-        st.caption("Reset / ustawienie hasła przez administratora")
-        target_email = st.text_input("E-mail użytkownika", value=email_logged, key="adm_target")
-        role_sel = st.selectbox("Rola", ["ksiegowosc", "krzysztof", "admin"], key="adm_role")
-        new_pw_admin = st.text_input("Nowe hasło użytkownika", type="password", key="adm_new")
-        if st.button("Ustaw hasło użytkownika", key="btn_admin_set"):
-            if len(new_pw_admin) < 8:
+    with col1:
+        st.caption("Zmiana własnego hasła")
+        old_pw = st.text_input("Stare hasło", type="password", key="own_old")
+        new_pw1 = st.text_input("Nowe hasło", type="password", key="own_new1")
+        new_pw2 = st.text_input("Powtórz nowe hasło", type="password", key="own_new2")
+        if st.button("Zmień własne hasło", type="primary", key="btn_change_own"):
+            if new_pw1 != new_pw2:
+                st.error("Nowe hasła nie są identyczne.")
+            elif len(new_pw1) < 8:
                 st.error("Hasło musi mieć co najmniej 8 znaków.")
             else:
-                admin_set_password(service, folder_id, email_logged, target_email, role_sel, new_pw_admin)
-                st.success(f"Ustawiono hasło dla: {target_email}")
+                ok = change_own_password(service, folder_id, email_logged, old_pw, new_pw1)
+                if ok:
+                    st.success("Hasło zmienione.")
+                    st.experimental_rerun()
+
+    with col2:
+        if role == "admin":
+            st.caption("Reset / ustawienie hasła przez administratora")
+            target_email = st.text_input("E-mail użytkownika", value=email_logged, key="adm_target")
+            role_sel = st.selectbox("Rola", ["ksiegowosc", "krzysztof", "admin"], key="adm_role")
+            new_pw_admin = st.text_input("Nowe hasło użytkownika", type="password", key="adm_new")
+            if st.button("Ustaw hasło użytkownika", key="btn_admin_set"):
+                if len(new_pw_admin) < 8:
+                    st.error("Hasło musi mieć co najmniej 8 znaków.")
+                else:
+                    admin_set_password(service, folder_id, email_logged, target_email, role_sel, new_pw_admin)
+                    st.success(f"Ustawiono hasło dla: {target_email}")
 
 
 if __name__ == "__main__":
