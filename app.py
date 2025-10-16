@@ -78,7 +78,7 @@ def get_role_from_login():
     3) Rate-limit: 5 nieudanych prób → blokada na 60s.
     """
     # --- SSO z Streamlit Cloud (opcjonalnie) ---
-    sso_user = getattr(st, "experimental_user", None)
+    sso_user = getattr(st, "user", None)
     sso_email = getattr(sso_user, "email", None)
 
     # --- Session: blokada po wielu błędach ---
@@ -174,13 +174,18 @@ def list_pdfs(service, folder_id) -> List[Dict[str, Any]]:
     results = service.files().list(q=query, fields="files(id, name, mimeType, createdTime, modifiedTime)").execute()
     return results.get("files", [])
 
-
-def find_file_by_name(service, folder_id, name: str) -> Optional[Dict[str, Any]]:
-    # Escape single quotes for Drive query
-    safe_name = name.replace("'", "\\'")
-    query = f"name = '{safe_name}' and '{folder_id}' in parents and trashed = false"
-    r = service.files().list(q=query, fields="files(id, name)").execute()
-    files = r.get("files", [])
+def find_file_by_name(service, folder_id: str, name: str):
+    safe = name.replace("'", "\\'")  # poprawne escape apostrofów
+    query = f"name = '{safe}' and '{folder_id}' in parents and trashed = false"
+    res = service.files().list(
+        q=query,
+        fields="files(id, name)",
+        spaces="drive",
+        pageSize=1,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+    files = res.get("files", [])
     return files[0] if files else None
 
 
